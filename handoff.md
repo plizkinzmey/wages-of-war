@@ -1,5 +1,42 @@
 # HANDOFF.md — Open Wages → Claude Code Session
 
+## 2026-09-02 — cross-platform bootstrap: SDL2 vendored, font bundled, game runs without env flags
+
+**Last Updated:** 2026-09-02
+**Project Status:** 🟢 The game now builds and runs with a plain `cargo run -p ow-app -- --data-dir ./data` on macOS with **no manual env-var exports**. Root cause of the earlier failure was a Windows-only build setup + Homebrew's `sdl2-compat` (SDL3 shim) crashing the SDL2 event parser.
+
+### What Was Done This Session
+
+1. **Copied game data into the repo** — full `WOW/` tree from the mounted disc image into `./data/WOW/` (~454 MB). Already covered by the existing `/data/` .gitignore rule, so it stays out of version control.
+
+2. **Forked the repo** (GitHub `suhteevah/wages-of-war` → `plizkinzmey/wages-of-war`):
+   - `origin`  → https://github.com/plizkinzmey/wages-of-war.git
+   - `upstream` → https://github.com/suhteevah/wages-of-war.git
+
+3. **Root-caused the SDL2 failure** (two distinct bugs):
+   - **sdl2-compat panic**: Modern Homebrew ships `sdl2-compat` (an SDL3 transplant) instead of real SDL2. rust-sdl2's event parser builds SDL2.x enums that don't map onto SDL3 values → `panic: trying to construct an enum from an invalid value 0x207`.
+   - **Font crash**: `TextRenderer` only searched Windows/Linux font paths (`C:\Windows\Fonts\...`, `/usr/share/fonts/...`). None exist on macOS → `Could not load any font`, game aborted on startup.
+   - **`bundled` is a dead end**: rust-sdl2's `bundled` feature compiles **only SDL2 core** — it explicitly does not build SDL2_mixer/SDL2_image/SDL2_ttf (confirmed in `sdl2-sys` build.rs). Since ow-app uses all four, `bundled` alone cannot satisfy the project.
+
+4. **Vendored SDL2 stack into `third_party/sdl2/`** (SDL2 2.30.12 + SDL2_mixer 2.8.2 + SDL2_image 2.8.5 + SDL2_ttf 2.24.0, built from source via cmake). Configured via:
+   - `scripts/bootstrap-sdl2.sh` — idempotent build script (downloads, builds, installs all four into `third_party/sdl2/`); skips already-built components.
+   - `.cargo/config.toml` — sets `PKG_CONFIG_PATH`, `LIBRARY_PATH`, `DYLD_LIBRARY_PATH` to `third_party/sdl2/...` with `relative = true` + `force = true`, so a plain `cargo run` links and finds the libs with zero env exports.
+   - Upgraded `sdl2` 0.37 → **0.38** and enabled `use-pkgconfig` feature (this is what makes sdl2-sys emit `rustc-link-search` from the `PKG_CONFIG_PATH`; without it the linker can't find `-lSDL2`).
+   - `.gitignore` excludes `/third_party/sdl2/` (regenerated on demand).
+
+5. **Bundled a libre font** — `assets/fonts/DejaVuSansMono.ttf` (+ `LICENSE-DejaVu.txt`). `TextRenderer` now tries the bundled font first (resolved from CWD and the exe dir), then system fonts as fallback. Result: text renders on any OS with no host font dependency.
+
+### Did NOT do
+- **MIDI/SoundFont**: SDL2_mixer logs a benign `No SoundFonts have been requested` warning on macOS (no synth SoundFont present), and the game continues without music. Fixing this is a separate follow-up.
+- The separate `re/` Ghidra RE work was untouched.
+
+### Build Command (verified working)
+```bash
+./scripts/bootstrap-sdl2.sh   # once, on a fresh clone
+cargo run -p ow-app -- --data-dir ./data
+```
+`cargo build --workspace` and `cargo run` both succeed with no env-var exports; the game reaches the Office screen, plays AVI intro, and processes clicks.
+
 ## 2026-05-03 — wall structure decoded, wall-rendering pass landed
 
 **Last Updated:** 2026-05-03

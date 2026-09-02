@@ -72,14 +72,19 @@ Key data files to expect:
 
 ## Build & Run
 ```bash
+# One-time dependency bootstrap: builds SDL2 + mixer/image/ttf from source
+# into third_party/sdl2/ (see scripts/bootstrap-sdl2.sh). macOS and Linux use
+# .sh; Windows uses scripts/bootstrap-sdl2.ps1.
+./scripts/bootstrap-sdl2.sh
+
 # Build everything
 cargo build --workspace
 
 # Run with verbose logging
-RUST_LOG=debug cargo run -p ow-app
+RUST_LOG=debug cargo run -p ow-app -- --data-dir ./data
 
 # Run with trace-level logging for a specific crate
-RUST_LOG=ow_data=trace,ow_core=debug cargo run -p ow-app
+RUST_LOG=ow_data=trace,ow_core=debug cargo run -p ow-app -- --data-dir ./data
 
 # Run RE survey tool against game files
 cargo run -p ow-tools --bin survey -- /path/to/wages-of-war/
@@ -87,6 +92,8 @@ cargo run -p ow-tools --bin survey -- /path/to/wages-of-war/
 # Deep-inspect a specific file
 cargo run -p ow-tools --bin triage -- /path/to/file.dat
 ```
+
+**SDL2 notes (cross-platform):** SDL is vendored into `third_party/sdl2/` and wired up via `.cargo/config.toml` (PKG_CONFIG_PATH / LIBRARY_PATH / DYLD_LIBRARY_PATH) so `cargo run` needs no env-var exports. Do NOT use rust-sdl2's `bundled` feature — it only compiles SDL2 core, never mixer/image/ttf. System Homebrew `sdl2-compat` (an SDL3 shim) panics the SDL2 event parser; always build from source via the bootstrap script.
 
 ## Code Style
 - `cargo fmt` before every commit

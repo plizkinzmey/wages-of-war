@@ -12,7 +12,6 @@
 //! linking against C libraries while supporting all legacy codecs.
 
 use sdl2::pixels::PixelFormatEnum;
-use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 use std::path::Path;
@@ -61,12 +60,16 @@ pub fn play_avi(
     // "Unrecognized audio format" errors from SDL2_mixer.
     let audio_ok = std::process::Command::new("ffmpeg")
         .args([
-            "-y", "-i",
+            "-y",
+            "-i",
             avi_path.to_str().unwrap_or(""),
-            "-vn",                   // no video
-            "-acodec", "pcm_s16le",  // signed 16-bit little-endian PCM
-            "-ar", "44100",          // match mixer sample rate
-            "-ac", "2",              // stereo to match mixer channels
+            "-vn", // no video
+            "-acodec",
+            "pcm_s16le", // signed 16-bit little-endian PCM
+            "-ar",
+            "44100", // match mixer sample rate
+            "-ac",
+            "2", // stereo to match mixer channels
             audio_path.to_str().unwrap_or(""),
         ])
         .stdout(std::process::Stdio::null())
@@ -78,18 +81,16 @@ pub fn play_avi(
     // Play via Chunk on channel 0 — more reliable than Music for WAV files.
     let _chunk = if audio_ok {
         match sdl2::mixer::Chunk::from_file(&audio_path) {
-            Ok(chunk) => {
-                match sdl2::mixer::Channel::all().play(&chunk, 0) {
-                    Ok(_) => {
-                        info!("cutscene audio playing");
-                        Some(chunk)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to play cutscene audio chunk");
-                        None
-                    }
+            Ok(chunk) => match sdl2::mixer::Channel::all().play(&chunk, 0) {
+                Ok(_) => {
+                    info!("cutscene audio playing");
+                    Some(chunk)
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "failed to play cutscene audio chunk");
+                    None
+                }
+            },
             Err(e) => {
                 warn!(error = %e, "failed to load cutscene audio WAV");
                 None
@@ -116,18 +117,15 @@ pub fn play_avi(
     };
 
     // Create a streaming texture for RGB24 frames (no alpha needed).
-    let mut texture = match texture_creator.create_texture_streaming(
-        PixelFormatEnum::RGB24,
-        width,
-        height,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            error!(error = %e, "failed to create video texture");
-            let _ = child.kill();
-            return true;
-        }
-    };
+    let mut texture =
+        match texture_creator.create_texture_streaming(PixelFormatEnum::RGB24, width, height) {
+            Ok(t) => t,
+            Err(e) => {
+                error!(error = %e, "failed to create video texture");
+                let _ = child.kill();
+                return true;
+            }
+        };
 
     let frame_size = (width * height * 3) as usize; // RGB24 = 3 bytes/pixel
     let frame_duration = Duration::from_secs_f64(1.0 / fps);
@@ -187,10 +185,11 @@ pub fn play_avi(
                         sdl2::event::Event::Quit { .. } => {
                             skipped = true;
                         }
-                        sdl2::event::Event::KeyDown { keycode: Some(k), .. }
-                            if k == sdl2::keyboard::Keycode::Escape
-                                || k == sdl2::keyboard::Keycode::Space
-                                || k == sdl2::keyboard::Keycode::Return =>
+                        sdl2::event::Event::KeyDown {
+                            keycode: Some(k), ..
+                        } if k == sdl2::keyboard::Keycode::Escape
+                            || k == sdl2::keyboard::Keycode::Space
+                            || k == sdl2::keyboard::Keycode::Return =>
                         {
                             info!(frame = frames_shown, "user skipped cutscene");
                             skipped = true;
@@ -234,8 +233,10 @@ fn probe_avi(path: &Path) -> Option<(u32, u32, f64)> {
     // Use ffprobe (bundled with ffmpeg) to get video stream info.
     let output = std::process::Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_streams",
             path.to_str()?,
         ])
@@ -259,7 +260,11 @@ fn probe_avi(path: &Path) -> Option<(u32, u32, f64)> {
             let fps = if let Some((num, den)) = rate_str.split_once('/') {
                 let n: f64 = num.parse().ok()?;
                 let d: f64 = den.parse().ok()?;
-                if d > 0.0 { n / d } else { 15.0 }
+                if d > 0.0 {
+                    n / d
+                } else {
+                    15.0
+                }
             } else {
                 rate_str.parse().unwrap_or(15.0)
             };

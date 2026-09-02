@@ -102,7 +102,11 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     // Set the window icon from the original game's Wow.ico if available.
-    let icon_path = args.data_dir.join("extracted").join("Group12").join("Wow.ico");
+    let icon_path = args
+        .data_dir
+        .join("extracted")
+        .join("Group12")
+        .join("Wow.ico");
     if icon_path.exists() {
         // SDL2 can load BMP/ICO surface — try loading the .ico directly.
         match sdl2::surface::Surface::load_bmp(&icon_path) {
@@ -113,7 +117,9 @@ fn main() -> anyhow::Result<()> {
             Err(e) => {
                 // ICO might not load as BMP — try using the SDL2 image loader if available.
                 info!("Could not load icon as BMP ({e}), trying SDL2_image");
-                if let Ok(icon_surface) = <sdl2::surface::Surface as sdl2::image::LoadSurface>::from_file(&icon_path) {
+                if let Ok(icon_surface) =
+                    <sdl2::surface::Surface as sdl2::image::LoadSurface>::from_file(&icon_path)
+                {
                     window.set_icon(&icon_surface);
                     info!("Window icon set from Wow.ico via SDL2_image");
                 }
@@ -154,7 +160,7 @@ fn main() -> anyhow::Result<()> {
     let game_state = ow_core::game_state::GameState::new(500_000);
     info!(phase = ?game_state.phase, "Entering game loop");
 
-    game_loop::run_game_loop_with_pump(&sdl_context, canvas, event_pump, game_state, ruleset, &args.data_dir)?;
+    game_loop::run_game_loop_with_pump(canvas, event_pump, game_state, ruleset, &args.data_dir)?;
 
     info!("Open Wages shutting down cleanly");
     Ok(())

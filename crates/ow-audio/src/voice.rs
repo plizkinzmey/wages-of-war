@@ -68,7 +68,10 @@ impl VoicePlayer {
         let current = sdl2::mixer::allocate_channels(-1); // query current count
         if current < 2 {
             let allocated = sdl2::mixer::allocate_channels(2);
-            debug!(channels = allocated, "Allocated SDL2_mixer channels for voice");
+            debug!(
+                channels = allocated,
+                "Allocated SDL2_mixer channels for voice"
+            );
         }
 
         info!(dir = %wav_dir.display(), "Voice player initialized");
@@ -203,19 +206,14 @@ mod tests {
     /// Create a minimal valid WAV file (44 bytes: header only, no audio data).
     fn write_dummy_wav(path: &Path) {
         let header: [u8; 44] = [
-            b'R', b'I', b'F', b'F',
-            36, 0, 0, 0,
-            b'W', b'A', b'V', b'E',
-            b'f', b'm', b't', b' ',
-            16, 0, 0, 0,
-            1, 0,        // PCM
-            1, 0,        // mono
+            b'R', b'I', b'F', b'F', 36, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't', b' ',
+            16, 0, 0, 0, 1, 0, // PCM
+            1, 0, // mono
             0x22, 0x56, 0, 0, // 22050 Hz
             0x22, 0x56, 0, 0, // byte rate
-            1, 0,        // block align
-            8, 0,        // 8 bits per sample
-            b'd', b'a', b't', b'a',
-            0, 0, 0, 0,  // data size
+            1, 0, // block align
+            8, 0, // 8 bits per sample
+            b'd', b'a', b't', b'a', 0, 0, 0, 0, // data size
         ];
         fs::write(path, &header).expect("failed to write dummy WAV");
     }

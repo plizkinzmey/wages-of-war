@@ -243,11 +243,16 @@ impl<'tc> TileMapRenderer<'tc> {
                 // and shift the tile upward on screen. This creates visual terrain
                 // elevation (hills, valleys) without actual 3D geometry.
                 let cell = map.get_cell(tx, ty);
-                let elev_offset = cell.map(|c| {
-                    let avg = (c.elevation_sw as f32 + c.elevation_se as f32
-                        + c.elevation_ne as f32 + c.elevation_nw as f32) / 4.0;
-                    avg * 2.0 * camera.zoom
-                }).unwrap_or(0.0);
+                let elev_offset = cell
+                    .map(|c| {
+                        let avg = (c.elevation_sw as f32
+                            + c.elevation_se as f32
+                            + c.elevation_ne as f32
+                            + c.elevation_nw as f32)
+                            / 4.0;
+                        avg * 2.0 * camera.zoom
+                    })
+                    .unwrap_or(0.0);
                 let draw_y = screen_pos.y - elev_offset;
 
                 let dst_w = (iso.tile_width * camera.zoom) as u32;

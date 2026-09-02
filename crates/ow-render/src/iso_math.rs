@@ -81,7 +81,13 @@ impl IsoConfig {
             sx += self.tile_width / 2.0;
         }
 
-        trace!(col = tile.x, row = tile.y, sx, sy, "tile->screen (staggered)");
+        trace!(
+            col = tile.x,
+            row = tile.y,
+            sx,
+            sy,
+            "tile->screen (staggered)"
+        );
         ScreenPos { x: sx, y: sy }
     }
 
@@ -101,7 +107,13 @@ impl IsoConfig {
         let col_raw = x - if row % 2 != 0 { half_w } else { 0.0 };
         let col = (col_raw / self.tile_width).floor() as i32;
 
-        trace!(sx = screen.x, sy = screen.y, col, row, "screen->tile (staggered)");
+        trace!(
+            sx = screen.x,
+            sy = screen.y,
+            col,
+            row,
+            "screen->tile (staggered)"
+        );
         TilePos { x: col, y: row }
     }
 }
@@ -125,7 +137,7 @@ mod tests {
         let cfg = wow_iso();
         let pos = cfg.tile_to_screen(TilePos { x: 5, y: 0 });
         assert_eq!(pos.x, 640.0); // 5 * 128
-        assert_eq!(pos.y, 0.0);   // 0 * 32
+        assert_eq!(pos.y, 0.0); // 0 * 32
     }
 
     #[test]
@@ -133,7 +145,7 @@ mod tests {
         let cfg = wow_iso();
         let pos = cfg.tile_to_screen(TilePos { x: 5, y: 1 });
         assert_eq!(pos.x, 704.0); // 5 * 128 + 64 (stagger)
-        assert_eq!(pos.y, 32.0);  // 1 * 32 (half-height row spacing)
+        assert_eq!(pos.y, 32.0); // 1 * 32 (half-height row spacing)
     }
 
     #[test]
@@ -141,7 +153,7 @@ mod tests {
         let cfg = wow_iso();
         let pos = cfg.tile_to_screen(TilePos { x: 5, y: 2 });
         assert_eq!(pos.x, 640.0); // even row, no stagger
-        assert_eq!(pos.y, 64.0);  // 2 * 32
+        assert_eq!(pos.y, 64.0); // 2 * 32
     }
 
     #[test]
