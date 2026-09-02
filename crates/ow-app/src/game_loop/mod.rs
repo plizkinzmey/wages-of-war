@@ -27,17 +27,29 @@
 //! The loop targets 60 fps with delta-time tracking. Delta is capped at 33 ms
 //! (floor of 30 fps) to prevent physics/animation explosions on hitches.
 
+mod asset_loader;
+mod audio_handles;
+mod audio_init;
 mod auto_screenshot;
 mod combat_log;
 mod dev_hotkeys;
 mod input;
+mod loop_pump;
+mod mission;
 mod music;
+mod office_layout;
 mod render;
 mod screenshot;
+mod soldier_anims;
 mod update;
 
+use asset_loader::{load_debrief_sprites, load_office_texture};
+use audio_init::init_audio;
 use input::{handle_escape, handle_phase_input};
+use loop_pump::{maybe_load_mission, maybe_transition_music};
+use mission::MissionData;
 use render::render_phase;
+use soldier_anims::SoldierAnims;
 use update::update_phase;
 
 pub(crate) use auto_screenshot::AutoScreenshot;
@@ -45,26 +57,21 @@ pub(crate) use combat_log::{log_combat, CombatLogEntry, CombatLogKind};
 pub(crate) use dev_hotkeys::handle_dev_hotkeys;
 pub(crate) use screenshot::{save_screenshot, write_canvas_as_bmp};
 
-use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use sdl2::mixer::Music;
 use sdl2::pixels::Color;
-use sdl2::render::{Canvas, Texture, TextureCreator};
-use sdl2::video::{Window, WindowContext};
-use tracing::{debug, info, trace, warn};
+use sdl2::render::Canvas;
+use sdl2::video::Window;
+use tracing::{debug, info};
 
-use ow_audio::sfx::SfxManager;
-use ow_audio::voice::VoicePlayer;
 use ow_core::game_state::{GamePhase, GameState, MissionPhase, OfficePhase};
 use ow_core::merc::MercId;
 
 use ow_core::ruleset::Ruleset;
 use ow_render::camera::Camera;
-use ow_render::iso_math::IsoConfig;
 use ow_render::text::TextRenderer;
 
 // ---------------------------------------------------------------------------
@@ -152,28 +159,23 @@ pub struct CombatHandler {
 
 /// Top-level game loop state, tying together game state, camera, and
 /// phase-specific handling.
+///
+/// Mission-scoped resources (map data, tile renderers, soldier textures,
+/// enemy units) and audio state live in [`MissionAssets`] and
+/// [`AudioHandles`] respectively — see those structs and the Phase B
+/// refactor plan in `docs/refactor-game-loop.md`.
 pub struct GameLoop {
     /// The campaign game state (phase, team, funds, mission context, etc.).
     pub game_state: GameState,
     /// Isometric camera controlling the viewport.
     pub camera: Camera,
-    /// Isometric projection configuration (tile dimensions, origin).
-    pub iso_config: IsoConfig,
     /// Phase-specific handler with per-phase mutable state.
     pub phase_handler: PhaseHandler,
     /// Current window dimensions (updated on resize).
     pub window_width: u32,
     pub window_height: u32,
-    /// Mission-specific IsoConfig (set when map loads, uses actual tile dimensions).
-    pub mission_iso: Option<IsoConfig>,
-    /// Enemy units for the current mission.
-    pub enemies: Vec<ow_core::mission_setup::EnemyUnit>,
     /// Combat message log (max 8 entries, newest at bottom). Color-coded by type.
     pub combat_log: Vec<CombatLogEntry>,
-    /// Persistent latch: once SDL2_mixer fails to load a MIDI file (no
-    /// SoundFont), we stop retrying for the rest of the session. This
-    /// prevents stderr spam from the MIDI loader on every frame.
-    pub music_broken: bool,
 }
 
 impl GameLoop {
@@ -184,19 +186,10 @@ impl GameLoop {
         Self {
             game_state,
             camera: Camera::new(WINDOW_WIDTH, WINDOW_HEIGHT),
-            iso_config: IsoConfig {
-                tile_width: 64.0,
-                tile_height: 32.0,
-                origin_x: (WINDOW_WIDTH as f32) / 2.0,
-                origin_y: 64.0,
-            },
             phase_handler,
             window_width: WINDOW_WIDTH,
             window_height: WINDOW_HEIGHT,
-            mission_iso: None,
-            enemies: Vec::new(),
             combat_log: Vec::new(),
-            music_broken: false,
         }
     }
 }
@@ -224,7 +217,7 @@ fn phase_handler_for(phase: &GamePhase) -> PhaseHandler {
     }
 }
 
-use music::{music_track_for_phase, music_track_for_phase_with_mission, start_music, stop_music};
+use music::stop_music;
 
 // ---------------------------------------------------------------------------
 // Color palette for placeholder rendering
@@ -302,6 +295,26 @@ fn phase_label(handler: &PhaseHandler) -> &'static str {
 ///
 /// # Returns
 /// `Ok(())` on clean exit, `Err` on SDL2 or fatal engine errors.
+///
+/// # Architecture
+///
+/// The body is split (Phase A + B of the refactor plan in
+/// `docs/refactor-game-loop.md`) into five cohesive sections:
+///
+/// 1. **One-time setup** — text renderer, audio device, SFX/voice
+///    players, office texture, debrief sprite sheets, the
+///    `Option<MissionData<'a>>` mission slot, the [`SoldierAnims`]
+///    bundle, the [`AudioHandles`] bundle.
+/// 2. **The per-frame loop** — event poll → update → animation tick →
+///    music transition → mission-load guard → render → present →
+///    sleep. Each step is a single helper call.
+/// 3. **Per-frame helpers** — animation dispatch, audio mixing,
+///    mission-resource loading. Each lives in its own module
+///    (see `soldier_anims`, `asset_loader`, `audio_init`,
+///    `loop_pump`).
+/// 4. **Cleanup** — drop the music handle and voice player before
+///    closing the mixer (cached Chunks must be freed while the device
+///    is open).
 pub fn run_game_loop_with_pump(
     mut canvas: Canvas<Window>,
     mut event_pump: sdl2::EventPump,
@@ -312,268 +325,28 @@ pub fn run_game_loop_with_pump(
     info!(phase = ?game_state.phase, "Starting game loop");
 
     let mut game = GameLoop::new(game_state);
-
-    // Initialize text rendering — loads a system font for UI text.
+    let texture_creator = canvas.texture_creator();
+    // SDL2_ttf is initialised once and lives for the whole loop. The
+    // TextRenderer below borrows from it; both must outlive every render
+    // call (cheap — they live on the run-loop stack until exit).
     let ttf_context =
         sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL2_ttf init failed: {e}"))?;
     let text_renderer = TextRenderer::new(&ttf_context, None)
         .map_err(|e| anyhow::anyhow!("Font loading failed: {e}"))?;
-    let texture_creator = canvas.texture_creator();
-
-    // -----------------------------------------------------------------------
-    // MIDI music via SDL2_mixer
-    // -----------------------------------------------------------------------
-    let midi_dir = data_dir.join("WOW").join("MIDI");
-    let audio_available = match sdl2::mixer::open_audio(44100, sdl2::mixer::AUDIO_S16LSB, 2, 1024) {
-        Ok(()) => {
-            info!("SDL2_mixer audio device opened (44100 Hz, S16LSB, stereo)");
-            true
-        }
-        Err(e) => {
-            warn!(error = %e, "SDL2_mixer failed to open audio -- continuing without music");
-            false
-        }
-    };
-
-    // Start initial music for whatever phase we launched into.
-    let mut current_music_track: Option<String> = None;
-    let mut _music_handle: Option<Music> = if audio_available {
-        let track = music_track_for_phase(&game.phase_handler);
-        if let Some(name) = track {
-            let handle = start_music(&midi_dir, name, &mut game.music_broken);
-            if handle.is_some() {
-                current_music_track = Some(name.to_string());
-            }
-            handle
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // -----------------------------------------------------------------------
-    // Combat SFX — pre-load WAV files from WOW/SND/ as mixer Chunks.
-    // Channels 2–7 are reserved for SFX; 0–1 stay free for voice/music.
-    // -----------------------------------------------------------------------
-    let snd_dir = data_dir.join("WOW").join("SND");
-    let mut sfx_manager = SfxManager::new(&snd_dir, audio_available);
-
-    // -----------------------------------------------------------------------
-    // Voice line playback — on-demand WAV loading from WOW/WAV/.
-    // Uses mixer channel 1 (separate from music and SFX channels 2-7).
-    // Voice lines play when hiring a merc or selecting one in combat.
-    // -----------------------------------------------------------------------
-    let wav_dir = data_dir.join("WOW").join("WAV");
-    let mut voice_player: Option<VoicePlayer> = if audio_available {
-        Some(VoicePlayer::new(wav_dir))
-    } else {
-        debug!("Voice player disabled (no audio device)");
-        None
-    };
-
-    // Load the office background image — OFFICE.PCX is the main HQ screen.
-    // The original game renders this as a 640x480 scene with clickable objects
-    // (phone, fax, filing cabinet, pizza, etc.) overlaid on the background.
-    let office_texture = {
-        // OFFICE.PCX is the base layer of the office scene. The original engine
-        // composites OBJ sprites on top for the interactive objects (phone, fax, etc.).
-        // OFFPIC2.PCX is a pre-composited version with all objects baked in.
-        // We use OFFPIC2 for now; proper compositing comes later.
-        let pcx_path = data_dir.join("WOW").join("PIC").join("OFFPIC2.PCX");
-        match ow_render::pcx::load_pcx(&pcx_path) {
-            Ok(img) => {
-                info!(
-                    width = img.width,
-                    height = img.height,
-                    "Office background loaded"
-                );
-                match ow_render::pcx::pcx_to_texture(&img, &texture_creator) {
-                    Ok(tex) => Some(tex),
-                    Err(e) => {
-                        warn!("Failed to create office texture: {e}");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to load OFFICE.PCX: {e}");
-                None
-            }
-        }
-    };
-
-    // -----------------------------------------------------------------------
-    // Debrief screen sprites -- accountant + video phone
-    // -----------------------------------------------------------------------
-    // ACCT.OBJ contains the accountant character sprites (animated on the
-    // video phone during the post-mission financial debrief). PHONSPR.OBJ
-    // contains the phone scene background frames. Both use the same FLC
-    // sprite container format as tilesets and OBJ files.
-    //
-    // We load all frames at startup and convert them to SDL2 textures so
-    // the debrief renderer can just index into them by frame number.
-    let (acct_textures, phone_textures) = {
-        // Use OFFPIC2.PCX palette -- it is the closest match to the game's
-        // master VGA palette and we already loaded it for the office scene.
-        let pic_dir = data_dir.join("WOW").join("PIC");
-        let palette = {
-            let offpic = pic_dir.join("OFFPIC2.PCX");
-            match ow_render::palette::load_pcx_palette(&offpic) {
-                Ok(pal) => Some(pal),
-                Err(e) => {
-                    warn!("Failed to load palette for debrief sprites: {e}");
-                    None
-                }
-            }
-        };
-
-        let spr_dir = data_dir.join("WOW").join("SPR");
-
-        /// Decode all frames from a sprite sheet into RGBA SDL2 textures.
-        /// Returns an empty vec if loading fails -- the renderer will fall
-        /// back to the placeholder debrief display.
-        fn load_sprite_textures<'a>(
-            path: &Path,
-            palette: &Option<ow_render::palette::Palette256>,
-            tc: &'a TextureCreator<WindowContext>,
-        ) -> Vec<Texture<'a>> {
-            let pal = match palette {
-                Some(p) => p,
-                None => {
-                    warn!(path = %path.display(),
-                          "no palette available -- skipping sprite load");
-                    return Vec::new();
-                }
-            };
-
-            let sheet = match ow_data::sprite::parse_sprite_file(path) {
-                Ok(s) => {
-                    info!(
-                        path = %path.display(),
-                        frames = s.file_header.sprite_count,
-                        "debrief sprite sheet loaded"
-                    );
-                    s
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e,
-                          "failed to parse debrief sprite sheet");
-                    return Vec::new();
-                }
-            };
-
-            let mut textures = Vec::with_capacity(sheet.frames.len());
-            for (i, frame) in sheet.frames.iter().enumerate() {
-                let fw = frame.header.width as u32;
-                let fh = frame.header.height as u32;
-                if fw == 0 || fh == 0 {
-                    // Some sprite sheets have empty placeholder frames.
-                    trace!(frame = i, "skipping zero-size sprite frame");
-                    continue;
-                }
-                match ow_data::sprite::decode_rle(
-                    &frame.compressed_data,
-                    frame.header.width,
-                    frame.header.height,
-                    i,
-                ) {
-                    Ok(pixels) => {
-                        // Brightness boost of 1.5 to compensate for CRT->LCD gamma.
-                        let rgba =
-                            ow_render::palette::apply_palette_with_brightness(&pixels, pal, 1.5);
-                        match tc.create_texture_static(
-                            sdl2::pixels::PixelFormatEnum::RGBA32,
-                            fw,
-                            fh,
-                        ) {
-                            Ok(mut tex) => {
-                                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                                if let Err(e) = tex.update(None, &rgba, (fw * 4) as usize) {
-                                    warn!(frame = i, error = %e,
-                                          "failed to upload sprite texture");
-                                } else {
-                                    textures.push(tex);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(frame = i, error = %e,
-                                      "failed to create sprite texture");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(frame = i, error = %e, "RLE decode failed for sprite frame");
-                    }
-                }
-            }
-            info!(
-                path = %path.display(),
-                decoded = textures.len(),
-                total = sheet.frames.len(),
-                "debrief sprite textures ready"
-            );
-            textures
-        }
-
-        let acct_path = spr_dir.join("ACCT.OBJ");
-        let phone_path = spr_dir.join("PHONSPR.OBJ");
-
-        let acct = load_sprite_textures(&acct_path, &palette, &texture_creator);
-        let phone = load_sprite_textures(&phone_path, &palette, &texture_creator);
-        (acct, phone)
-    };
-
-    // -- Mission map resources (loaded when entering deployment) --
-    // These are Option because they don't exist until a mission starts.
-    let mut tile_renderer: Option<ow_render::tile_renderer::TileMapRenderer> = None;
-    let mut obj_renderer: Option<ow_render::tile_renderer::TileMapRenderer> = None;
-    let mut loaded_map: Option<ow_data::map_loader::GameMap> = None;
-    let mut mission_iso_config: Option<IsoConfig> = None;
-
-    // Soldier animation system: all frames from ANIM/JUNGSLD.DAT decoded into
-    // textures, indexed by the AnimController's current_frame_index().
-    // The COR file maps (action, direction, weapon) → frame ranges.
-    let mut soldier_textures: Vec<Option<Texture>> = Vec::new();
-    let mut soldier_anim_set: Option<ow_data::animation::AnimationSet> = None;
-    // Per-merc animation controllers, keyed by merc index in the team.
-    let mut soldier_anims: Vec<ow_render::anim_controller::AnimController> = Vec::new();
-
-    // Per-merc snapshot of state from the previous frame, in lockstep with
-    // `game.game_state.team`. Drives the animation state-watcher below: when
-    // a merc's position / hp / ap differs from its snapshot, we transition
-    // its AnimController accordingly. Tuple is (id, position, hp, ap).
-    let mut prev_merc_states: Vec<(MercId, Option<ow_core::merc::TilePos>, u32, u32)> = Vec::new();
-    // Frames remaining before Walk auto-reverts to Idle. Tracks per-merc by
-    // index. Set on each Walk transition; counted down each frame.
-    let mut walk_grace_remaining: Vec<u32> = Vec::new();
-    // Backwards compat — kept as fallback if full animation loading fails.
-    let soldier_texture: Option<Texture> = None;
-
-    // Enemy units generated from mission data. Stored here so they persist
-    // across the deployment and combat phases.
-    let mut enemy_units: Vec<ow_core::mission_setup::EnemyUnit> = Vec::new();
+    let mut audio = init_audio(data_dir, &game.phase_handler);
+    let office_texture = load_office_texture(data_dir, &texture_creator);
+    let (acct_textures, phone_textures) = load_debrief_sprites(data_dir, &texture_creator);
+    let mut mission: Option<MissionData<'_>> = None;
+    let mut anims = SoldierAnims::empty();
 
     let mut last_frame = Instant::now();
     let mut running = true;
-    let mut _screenshot_count = 0u32;
-
-    // -----------------------------------------------------------------------
-    // Dev auto-screenshot — env-gated. When `OW_AUTO_SCREENSHOT_MS` is set
-    // to a positive integer, the loop drops a BMP into
-    // `dev-screenshots/run-<unix-ts>/` every N ms, with a phase tag in the
-    // filename so a thousand frames are still searchable. This exists so an
-    // analysis session can see what actually rendered during a play session
-    // without anyone hand-pressing F12 every few seconds. Disabled by default;
-    // pure dev tooling, gitignored output dir.
-    // -----------------------------------------------------------------------
     let mut auto_screenshot = AutoScreenshot::from_env();
 
     // -----------------------------------------------------------------------
     // Main loop: poll events -> update -> render -> present -> sleep
     // -----------------------------------------------------------------------
     while running {
-        // -- Delta time calculation --
         let now = Instant::now();
         let raw_delta_ms = now.duration_since(last_frame).as_millis() as u32;
         let delta_ms = raw_delta_ms.min(MAX_DELTA_MS);
@@ -586,16 +359,12 @@ pub fn run_game_loop_with_pump(
                     info!("Quit event received");
                     running = false;
                 }
-
-                // ESC toggles pause overlay (or quits from pause)
                 Event::KeyDown {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => {
                     running = handle_escape(&mut game);
                 }
-
-                // Track window resizes so click coordinates scale correctly.
                 Event::Window {
                     win_event: sdl2::event::WindowEvent::Resized(w, h),
                     ..
@@ -604,30 +373,26 @@ pub fn run_game_loop_with_pump(
                     game.window_height = h as u32;
                     debug!(width = w, height = h, "Window resized");
                 }
-
-                // ======= FILE-LEVEL HOTKEYS (F12 + F1-F5 + M) =======
-                // F12 saves a screenshot to disk.
                 Event::KeyDown {
                     keycode: Some(Keycode::F12),
                     ..
                 } => {
                     save_screenshot(&canvas);
                 }
-
                 // F1-F5 + M (cheat/dev). `handle_dev_hotkeys` is a no-op on
                 // non-keydown events and on unknown keycodes.
                 Event::KeyDown { .. } => {
-                    handle_dev_hotkeys(&mut game, &event);
+                    handle_dev_hotkeys(&mut game, mission.as_mut(), &event);
                 }
-
                 // Delegate all other input to the current phase handler
                 _ => {
                     handle_phase_input(
                         &mut game,
+                        mission.as_mut(),
                         &event,
                         &ruleset,
-                        &mut sfx_manager,
-                        &mut voice_player,
+                        &mut audio.sfx_manager,
+                        &mut audio.voice_player,
                     );
                 }
             }
@@ -638,512 +403,35 @@ pub fn run_game_loop_with_pump(
         }
 
         // -- Update --
-        update_phase(&mut game, delta_ms, &mut sfx_manager);
+        update_phase(
+            &mut game,
+            mission.as_mut(),
+            delta_ms,
+            &mut audio.sfx_manager,
+        );
 
-        // Drive soldier animations from merc state changes. The
-        // AnimController already plays the chosen action; this block
-        // decides WHEN to switch by diffing each merc's position / hp / ap
-        // against the previous frame's snapshot. Walk fires on position
-        // delta with an 8-way direction computed from the move vector.
-        // ShootStand fires when AP drops without movement (i.e. the click
-        // resolved as an attack). Die fires once on the alive→0-hp edge.
-        // Without this watcher the controllers stay stuck on Idle, which
-        // is the bug the handoff documented as "only idle plays."
-        {
-            use ow_render::anim_controller::{AnimAction, Direction};
-
-            // Map a tile-delta to one of 8 cardinal/diagonal directions.
-            // +y is south on the staggered isometric grid (row index grows
-            // downward), so the dy sign maps directly to N/S.
-            fn dir_from_delta(dx: i32, dy: i32) -> Direction {
-                match (dx.signum(), dy.signum()) {
-                    (0, -1) => Direction::N,
-                    (1, -1) => Direction::NE,
-                    (1, 0) => Direction::E,
-                    (1, 1) => Direction::SE,
-                    (0, 1) => Direction::S,
-                    (-1, 1) => Direction::SW,
-                    (-1, 0) => Direction::W,
-                    (-1, -1) => Direction::NW,
-                    _ => Direction::S,
-                }
-            }
-
-            for (i, merc) in game.game_state.team.iter().enumerate() {
-                let Some(ctrl) = soldier_anims.get_mut(i) else {
-                    continue;
-                };
-                let prev = prev_merc_states.get(i).copied();
-                let prev_pos = prev.and_then(|p| p.1);
-                let prev_hp = prev.map(|p| p.2).unwrap_or(merc.current_hp);
-                let prev_ap = prev.map(|p| p.3).unwrap_or(merc.current_ap);
-
-                // Death edge: alive last frame, dead this frame. Set Die
-                // and skip — the controller will hold the final death frame.
-                if prev_hp > 0 && merc.current_hp == 0 {
-                    ctrl.set_action(AnimAction::Die, Direction::S, 1);
-                    continue;
-                }
-                if merc.current_hp == 0 {
-                    continue;
-                }
-
-                // Movement: position changed since last frame.
-                if let (Some(np), Some(pp)) = (merc.position, prev_pos) {
-                    if np.x != pp.x || np.y != pp.y {
-                        let dir = dir_from_delta(np.x - pp.x, np.y - pp.y);
-                        ctrl.set_action(AnimAction::Walk, dir, 1);
-                        continue;
-                    }
-                }
-
-                // Shoot: AP dropped without a position change, i.e. the
-                // player's click resolved as an attack. Direction here is
-                // a default (S) — refining this requires plumbing the
-                // target tile through to the watcher; out of scope for now.
-                // The animation still plays and looks correct because the
-                // sprite mostly faces the camera at S.
-                if merc.current_ap < prev_ap {
-                    ctrl.set_action(AnimAction::ShootStand, Direction::S, 1);
-                    continue;
-                }
-            }
-
-            // Auto-revert finishing one-shot animations (ShootStand/Hit/
-            // Throw/Melee) back to Idle, and revert Walk after a brief
-            // grace period since the in-game movement is teleport-based —
-            // Walk only ever fires for one frame so the loop would
-            // otherwise march in place forever.
-            const WALK_GRACE_FRAMES: u32 = 24; // ~400ms at 60fps
-            for (i, merc) in game.game_state.team.iter().enumerate() {
-                let Some(ctrl) = soldier_anims.get_mut(i) else {
-                    continue;
-                };
-                if merc.current_hp == 0 {
-                    continue;
-                }
-                let cur_action = ctrl.state().map(|s| s.action);
-                match cur_action {
-                    Some(AnimAction::ShootStand)
-                    | Some(AnimAction::ShootCrouch)
-                    | Some(AnimAction::Hit)
-                    | Some(AnimAction::Throw)
-                    | Some(AnimAction::Melee)
-                        if ctrl.is_finished() =>
-                    {
-                        ctrl.set_action(AnimAction::Idle, Direction::S, 1);
-                        if let Some(slot) = walk_grace_remaining.get_mut(i) {
-                            *slot = 0;
-                        }
-                    }
-                    Some(AnimAction::Walk) => {
-                        let slot = match walk_grace_remaining.get_mut(i) {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        *slot = slot.saturating_sub(1);
-                        if *slot == 0 {
-                            ctrl.set_action(AnimAction::Idle, Direction::S, 1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Resize the walk-grace tracker to match team length, and reset
-            // the counter for any merc whose Walk animation just (re)fired.
-            walk_grace_remaining.resize(game.game_state.team.len(), 0);
-            for (i, merc) in game.game_state.team.iter().enumerate() {
-                let Some(prev) = prev_merc_states.get(i).copied() else {
-                    continue;
-                };
-                if let (Some(np), Some(pp)) = (merc.position, prev.1) {
-                    if np.x != pp.x || np.y != pp.y {
-                        if let Some(slot) = walk_grace_remaining.get_mut(i) {
-                            *slot = WALK_GRACE_FRAMES;
-                        }
-                    }
-                }
-            }
-
-            // Snapshot for next frame's diff. Resized to match team length.
-            prev_merc_states.clear();
-            prev_merc_states.extend(
-                game.game_state
-                    .team
-                    .iter()
-                    .map(|m| (m.id, m.position, m.current_hp, m.current_ap)),
-            );
-        }
-
-        // Tick soldier animation controllers so idle/walk/shoot frames advance.
-        for ctrl in soldier_anims.iter_mut() {
-            ctrl.update(delta_ms as f32);
-        }
+        // -- Animation state-machine --
+        // Diffs each merc's position/hp/ap against the previous frame's
+        // snapshot, dispatches Walk / ShootStand / Die transitions,
+        // and ticks the controllers so the chosen action's frames advance.
+        anims.tick(&game.game_state.team, delta_ms);
 
         // -- Music transitions on phase change --
-        // Compare what we're currently playing to what the new phase wants.
-        // If they differ, stop old music and start the new track.
-        // Uses mission number for mission-phase track selection (WOWMIS01–09).
-        if audio_available {
-            let mission_num = game
-                .game_state
-                .current_mission
-                .as_ref()
-                .and_then(|m| m.name.strip_prefix("MSSN"))
-                .and_then(|n| n.parse::<u32>().ok());
-            let wanted = music_track_for_phase_with_mission(&game.phase_handler, mission_num);
-            let need_change = match (&wanted, &current_music_track) {
-                // Pause: don't touch music at all.
-                _ if matches!(game.phase_handler, PhaseHandler::Paused { .. }) => false,
-                (Some(w), Some(c)) => w.as_str() != c.as_str(),
-                (Some(_), None) => true,
-                (None, Some(_)) => true,
-                (None, None) => false,
-            };
-            if need_change {
-                stop_music();
-                if let Some(track_name) = &wanted {
-                    let handle = start_music(&midi_dir, track_name, &mut game.music_broken);
-                    if handle.is_some() {
-                        current_music_track = Some(track_name.clone());
-                    } else {
-                        current_music_track = None;
-                    }
-                    _music_handle = handle;
-                } else {
-                    _music_handle = None;
-                    current_music_track = None;
-                }
-            }
-        }
+        maybe_transition_music(&game, &mut audio, data_dir);
 
-        // -- Load mission map when entering deployment for the first time --
-        // We check if we just transitioned to Deployment and haven't loaded a map yet.
-        if matches!(game.phase_handler, PhaseHandler::Deployment { .. }) && loaded_map.is_none() {
-            // Determine which mission scenario to load from the accepted contract.
-            let mission_num = game
-                .game_state
-                .current_mission
-                .as_ref()
-                .and_then(|m| m.name.strip_prefix("MSSN"))
-                .and_then(|n| n.parse::<u32>().ok())
-                .unwrap_or(1);
+        // -- Lazy-load mission map the first time we enter Deployment --
+        maybe_load_mission(
+            &mut game,
+            &mut mission,
+            &mut anims,
+            &ruleset,
+            data_dir,
+            &texture_creator,
+        );
 
-            info!(mission = mission_num, "Loading mission map for deployment");
-
-            // Load MAP file from WOW/MAPS/SCEN{n}/
-            // Try SCEN{n}.MAP first, then SCEN{n}A.MAP (the actual filename varies).
-            let scen_dir = data_dir
-                .join("WOW")
-                .join("MAPS")
-                .join(format!("SCEN{mission_num}"));
-            let map_path = {
-                let try1 = scen_dir.join(format!("SCEN{mission_num}.MAP"));
-                let try2 = scen_dir.join(format!("SCEN{mission_num}A.MAP"));
-                if try1.exists() {
-                    try1
-                } else {
-                    try2
-                }
-            };
-
-            match ow_data::map_loader::parse_map(&map_path) {
-                Ok(map) => {
-                    info!(width = map.width(), height = map.height(),
-                          tileset = %map.asset_refs.tileset_path, "Map loaded");
-
-                    // Load the TIL tileset referenced by the MAP's string table.
-                    // The MAP references paths like "C:\WOW\SPR\SCEN1\TILSCN01.TIL".
-                    // The TIL files live in WOW/SPR/SCEN{n}/, not WOW/MAPS/SCEN{n}/.
-                    let til_name =
-                        ow_data::map_loader::filename_from_build_path(&map.asset_refs.tileset_path);
-                    let spr_scen_dir = data_dir
-                        .join("WOW")
-                        .join("SPR")
-                        .join(format!("SCEN{mission_num}"));
-                    let til_path = spr_scen_dir.join(til_name);
-                    match ow_data::sprite::parse_sprite_file(&til_path) {
-                        Ok(tileset) => {
-                            info!(sprites = tileset.file_header.sprite_count, "Tileset loaded");
-
-                            // Load the palette from a PCX in PIC/.
-                            // TODO: The game uses a master VGA palette that differs from
-                            // individual PCX palettes. For now we use OFFPIC2.PCX which
-                            // has the closest match to the terrain colors.
-                            let pic_dir = data_dir.join("WOW").join("PIC");
-                            let pal_pcx = {
-                                // Try OFFPIC2 first (office scene, closest to game palette)
-                                let offpic = pic_dir.join("OFFPIC2.PCX");
-                                if offpic.exists() {
-                                    Some(offpic)
-                                } else {
-                                    std::fs::read_dir(&pic_dir).ok().and_then(|entries| {
-                                        entries
-                                            .flatten()
-                                            .find(|e| {
-                                                e.path().extension().map(|x| x.to_ascii_uppercase())
-                                                    == Some("PCX".into())
-                                            })
-                                            .map(|e| e.path())
-                                    })
-                                }
-                            };
-                            if let Some(pcx_path) = pal_pcx {
-                                match ow_render::palette::load_pcx_palette(&pcx_path) {
-                                    Ok(pal) => {
-                                        // Create tile renderer and load textures.
-                                        let mut tr = ow_render::tile_renderer::TileMapRenderer::new(
-                                            &texture_creator,
-                                        );
-                                        if let Err(e) = tr.load_tileset(&tileset, &pal) {
-                                            warn!("Failed to load tileset textures: {e}");
-                                        } else {
-                                            let tw = tr.tile_pixel_width() as f32;
-                                            let th = tr.tile_pixel_height() as f32;
-                                            info!(
-                                                tile_w = tw,
-                                                tile_h = th,
-                                                tiles = tr.tile_count(),
-                                                "Tiles ready"
-                                            );
-
-                                            // Configure iso projection for the staggered grid.
-                                            // Wages of War uses a staggered grid, NOT standard
-                                            // diamond iso. Tile dimensions are 128x64 from the exe.
-                                            // tile_width = 128 (full tile width, horizontal step)
-                                            // tile_height = 64 (full tile height, vertical step)
-                                            // Odd rows are offset +64px by tile_to_screen().
-                                            let mis_iso = IsoConfig {
-                                                tile_width: 128.0,
-                                                tile_height: 64.0,
-                                                origin_x: 0.0,
-                                                origin_y: 0.0,
-                                            };
-                                            game.mission_iso = Some(IsoConfig {
-                                                tile_width: 128.0,
-                                                tile_height: 64.0,
-                                                origin_x: 0.0,
-                                                origin_y: 0.0,
-                                            });
-                                            mission_iso_config = Some(mis_iso);
-
-                                            // Center the camera on the middle of the 140x72
-                                            // staggered grid. Use the initial camera position
-                                            // from the MAP file if available, otherwise center
-                                            // on the map midpoint.
-                                            // Camera position: use MAP's stored position if
-                                            // available, otherwise center on the map.
-                                            // Row spacing is half tile height (32px) for
-                                            // interlocking diamonds.
-                                            // The exe stores camera coords using 64px row
-                                            // spacing, but we render with 32px (half-height
-                                            // for diamond interlocking). Halve the Y value.
-                                            let mid_x = if map.header.camera_x != 0 {
-                                                map.header.camera_x as f32
-                                            } else {
-                                                (map.width() as f32 / 2.0) * 128.0
-                                            };
-                                            // Camera Y from MAP uses 64px row spacing but
-                                            // we render at 32px (half-height). Halve it.
-                                            let mid_y = if map.header.camera_y != 0 {
-                                                (map.header.camera_y as f32) / 2.0
-                                            } else {
-                                                (map.height() as f32 / 2.0) * 32.0
-                                            };
-                                            game.camera.x =
-                                                mid_x - (game.window_width as f32 / 2.0);
-                                            game.camera.y =
-                                                mid_y - (game.window_height as f32 / 2.0);
-                                            tile_renderer = Some(tr);
-
-                                            // Load the OBJ sprite sheet for map objects
-                                            // (buildings, walls, fences, trees).
-                                            // Same sprite container format as TIL, lives
-                                            // in the same SPR/SCEN{n}/ directory.
-                                            let obj_name =
-                                                ow_data::map_loader::filename_from_build_path(
-                                                    &map.asset_refs.object_sprite_path,
-                                                );
-                                            let obj_path = spr_scen_dir.join(obj_name);
-                                            if obj_path.exists() {
-                                                match ow_data::sprite::parse_sprite_file(&obj_path)
-                                                {
-                                                    Ok(obj_sheet) => {
-                                                        info!(
-                                                            sprites = obj_sheet.file_header.sprite_count,
-                                                            path = %obj_path.display(),
-                                                            "OBJ sprite sheet loaded"
-                                                        );
-                                                        let mut or = ow_render::tile_renderer::TileMapRenderer::new(&texture_creator);
-                                                        if let Err(e) =
-                                                            or.load_tileset(&obj_sheet, &pal)
-                                                        {
-                                                            warn!(
-                                                                "Failed to load OBJ textures: {e}"
-                                                            );
-                                                        } else {
-                                                            info!(
-                                                                obj_tiles = or.tile_count(),
-                                                                obj_w = or.tile_pixel_width(),
-                                                                obj_h = or.tile_pixel_height(),
-                                                                "OBJ textures ready"
-                                                            );
-                                                            obj_renderer = Some(or);
-                                                        }
-                                                    }
-                                                    Err(e) => warn!(
-                                                        "Failed to load OBJ sheet {obj_name}: {e}"
-                                                    ),
-                                                }
-                                            } else {
-                                                warn!(path = %obj_path.display(), "OBJ sprite file not found");
-                                            }
-
-                                            // Load soldier animation: COR index + DAT sprite frames.
-                                            let anim_dir = data_dir.join("WOW").join("ANIM");
-                                            let cor_path = anim_dir.join("JUNGSLD.COR");
-                                            let sld_path = anim_dir.join("JUNGSLD.DAT");
-
-                                            if cor_path.exists() {
-                                                match ow_data::animation::parse_animation(&cor_path)
-                                                {
-                                                    Ok(anim_set) => {
-                                                        info!(
-                                                            entries = anim_set.entries.len(),
-                                                            "COR animation index loaded"
-                                                        );
-                                                        soldier_anim_set = Some(anim_set);
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to parse JUNGSLD.COR: {e}")
-                                                    }
-                                                }
-                                            }
-
-                                            if sld_path.exists() {
-                                                match ow_data::sprite::parse_sprite_file(&sld_path)
-                                                {
-                                                    Ok(sld_sheet) => {
-                                                        let total = sld_sheet.frames.len();
-                                                        let max_frames = total.min(2000);
-                                                        info!(
-                                                            total,
-                                                            loading = max_frames,
-                                                            "Decoding soldier frames"
-                                                        );
-                                                        soldier_textures.clear();
-                                                        let mut decoded = 0u32;
-                                                        for i in 0..max_frames {
-                                                            let frame = &sld_sheet.frames[i];
-                                                            let fw = frame.header.width as u32;
-                                                            let fh = frame.header.height as u32;
-                                                            if fw == 0 || fh == 0 {
-                                                                soldier_textures.push(None);
-                                                                continue;
-                                                            }
-                                                            let tex_opt = ow_data::sprite::decode_rle(
-                                                                &frame.compressed_data, frame.header.width, frame.header.height, i,
-                                                            ).ok().and_then(|pixels| {
-                                                                let rgba = ow_render::palette::apply_palette_with_brightness(&pixels, &pal, 1.5);
-                                                                let mut tex = texture_creator.create_texture_static(
-                                                                    sdl2::pixels::PixelFormatEnum::RGBA32, fw, fh,
-                                                                ).ok()?;
-                                                                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                                                                tex.update(None, &rgba, (fw * 4) as usize).ok()?;
-                                                                decoded += 1;
-                                                                Some(tex)
-                                                            });
-                                                            soldier_textures.push(tex_opt);
-                                                        }
-                                                        info!(
-                                                            decoded,
-                                                            "Soldier animation frames ready"
-                                                        );
-
-                                                        // Create per-merc AnimControllers in idle pose.
-                                                        if let Some(ref anim_set) = soldier_anim_set
-                                                        {
-                                                            soldier_anims.clear();
-                                                            for _merc in &game.game_state.team {
-                                                                let mut ctrl = ow_render::anim_controller::AnimController::new(anim_set.clone());
-                                                                ctrl.set_action(
-                                                                    ow_render::anim_controller::AnimAction::Idle,
-                                                                    ow_render::anim_controller::Direction::S, 1,
-                                                                );
-                                                                soldier_anims.push(ctrl);
-                                                            }
-                                                            info!(
-                                                                controllers = soldier_anims.len(),
-                                                                "AnimControllers ready"
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to load JUNGSLD.DAT: {e}")
-                                                    }
-                                                }
-                                            } else {
-                                                warn!(path = %sld_path.display(), "JUNGSLD.DAT not found");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => warn!("Palette error: {e}"),
-                                }
-                            }
-                            // Generate enemy units from mission data.
-                            let mission_key = format!("MSSN{mission_num:02}");
-                            if let Some(mission_data) = ruleset.missions.get(&mission_key) {
-                                let mut rng = rand::thread_rng();
-                                // Generate enemies with random positions on the map.
-                                let max_player_id =
-                                    game.game_state.team.iter().map(|m| m.id).max().unwrap_or(0);
-                                let mut next_id = max_player_id + 1000;
-
-                                for (i, rating) in mission_data.enemy_ratings.iter().enumerate() {
-                                    use rand::Rng;
-                                    // Roll for presence
-                                    let roll: u8 = rng.gen_range(0..100);
-                                    if roll >= rating.presence_chance {
-                                        continue;
-                                    }
-                                    // Generate enemy with a random position in the upper portion of the map.
-                                    let ex: i32 = rng.gen_range(20..180);
-                                    let ey: i32 = rng.gen_range(10..100);
-                                    let default_weapon = ow_data::mission::EnemyWeapon {
-                                        weapon1: -1,
-                                        weapon2: -1,
-                                        ammo1: 0,
-                                        ammo2: 0,
-                                        weapon3: -1,
-                                        extra: 0,
-                                    };
-                                    let weapon = mission_data
-                                        .enemy_weapons
-                                        .get(i)
-                                        .unwrap_or(&default_weapon);
-                                    let mut enemy = ow_core::mission_setup::EnemyUnit::from_rating(
-                                        next_id, rating, weapon,
-                                    );
-                                    enemy.position = Some(ow_core::merc::TilePos { x: ex, y: ey });
-                                    next_id += 1;
-                                    enemy_units.push(enemy);
-                                }
-                                game.enemies = enemy_units.clone();
-                                info!(enemies = enemy_units.len(), "Enemies generated for mission");
-                            }
-
-                            loaded_map = Some(map);
-                        }
-                        Err(e) => warn!("Failed to load tileset {til_name}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Failed to load map {}: {e}", map_path.display()),
-            }
-        }
-
-        // -- Update window dimensions every frame (handles fullscreen, DPI changes,
-        // and resize events we might miss). Cheap call, prevents coordinate bugs. --
+        // -- Window dimensions every frame (handles fullscreen, DPI changes,
+        // and resize events we might miss). Cheap call, prevents coordinate
+        // bugs. --
         let (cw, ch) = canvas.window().size();
         game.window_width = cw;
         game.window_height = ch;
@@ -1155,23 +443,17 @@ pub fn run_game_loop_with_pump(
 
         render_phase(
             &game,
+            mission.as_ref(),
+            &anims,
             &mut canvas,
             &text_renderer,
             &texture_creator,
             &ruleset,
             &office_texture,
-            &tile_renderer,
-            &obj_renderer,
-            &loaded_map,
-            &mission_iso_config,
-            &soldier_texture,
             &acct_textures,
             &phone_textures,
-            &soldier_textures,
-            &soldier_anims,
         );
 
-        // Title bar shows the current phase (placeholder for real UI)
         let label = phase_label(&game.phase_handler);
         canvas
             .window_mut()
@@ -1180,13 +462,11 @@ pub fn run_game_loop_with_pump(
 
         canvas.present();
 
-        // Dev auto-screenshot tick. Cheap when disabled (one field check).
         if let Some(auto_ss) = auto_screenshot.as_mut() {
             auto_ss.tick(&canvas, label);
         }
 
         // -- Frame pacing --
-        // Sleep for remaining frame budget to hit ~60 fps.
         let frame_elapsed = now.elapsed().as_millis() as u32;
         if frame_elapsed < TARGET_FRAME_MS {
             std::thread::sleep(std::time::Duration::from_millis(
@@ -1195,12 +475,12 @@ pub fn run_game_loop_with_pump(
         }
     }
 
-    // Clean up music before exit.
-    drop(_music_handle);
-    // Drop voice player before closing audio device — cached Chunks
-    // must be freed while the mixer is still open.
-    drop(voice_player);
-    if audio_available {
+    // -- Cleanup --
+    // Drop music handle and voice player before closing the audio device
+    // — cached Chunks must be freed while the mixer is still open.
+    drop(audio._music_handle);
+    drop(audio.voice_player);
+    if audio.audio_available {
         stop_music();
         sdl2::mixer::close_audio();
         debug!("SDL2_mixer audio closed");

@@ -6,30 +6,24 @@ use ow_audio::sfx::{CombatSound, SfxManager};
 use ow_core::game_state::{GamePhase, MissionPhase};
 
 use super::input::advance_initiative;
+use super::mission::MissionData;
 use super::{log_combat, CombatLogKind, GameLoop, PhaseHandler};
 
 /// Tick the current phase's update logic.
-pub(crate) fn update_phase(game: &mut GameLoop, delta_ms: u32, sfx: &mut SfxManager) {
-    // Snapshot the phase discriminant to avoid borrowing game.phase_handler
-    // across the update call.
-    enum UpdateRoute {
-        Travel,
-        Combat,
-        Debrief,
-        Other,
-    }
-
-    let route = match &game.phase_handler {
-        PhaseHandler::Travel { .. } => UpdateRoute::Travel,
-        PhaseHandler::Combat(_) => UpdateRoute::Combat,
-        PhaseHandler::Debrief { .. } => UpdateRoute::Debrief,
-        _ => UpdateRoute::Other,
-    };
-
-    match route {
-        UpdateRoute::Travel => update_travel(game, delta_ms),
-        UpdateRoute::Combat => update_combat(game, delta_ms, sfx),
-        UpdateRoute::Debrief => {
+pub(crate) fn update_phase(
+    game: &mut GameLoop,
+    mission: Option<&mut MissionData>,
+    delta_ms: u32,
+    sfx: &mut SfxManager,
+) {
+    match &game.phase_handler {
+        PhaseHandler::Travel { .. } => update_travel(game, delta_ms),
+        PhaseHandler::Combat(_) => {
+            if let Some(m) = mission {
+                update_combat(game, m, delta_ms, sfx);
+            }
+        }
+        PhaseHandler::Debrief { .. } => {
             // Tick the accountant animation timer so sprite frames cycle
             // on the video phone during the debrief screen.
             if let PhaseHandler::Debrief {
@@ -39,8 +33,10 @@ pub(crate) fn update_phase(game: &mut GameLoop, delta_ms: u32, sfx: &mut SfxMana
                 *anim_elapsed_ms = anim_elapsed_ms.saturating_add(delta_ms);
             }
         }
-        UpdateRoute::Other => {
-            // Office, Deployment, Extraction, Paused:
+        PhaseHandler::Office { .. }
+        | PhaseHandler::Deployment { .. }
+        | PhaseHandler::Extraction
+        | PhaseHandler::Paused { .. } => {
             // No per-frame update logic (purely input-driven).
         }
     }
@@ -70,7 +66,12 @@ fn update_travel(game: &mut GameLoop, delta_ms: u32) {
 ///
 /// When it's an enemy's turn, the AI picks and executes one action per frame.
 /// This gives a visible cadence to enemy actions and keeps the frame rate smooth.
-fn update_combat(game: &mut GameLoop, _delta_ms: u32, sfx: &mut SfxManager) {
+fn update_combat(
+    game: &mut GameLoop,
+    mission: &mut MissionData,
+    _delta_ms: u32,
+    sfx: &mut SfxManager,
+) {
     // -- AI turn processing --
     let ai_acting = match &game.phase_handler {
         PhaseHandler::Combat(c) => c.ai_acting,
@@ -91,7 +92,7 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32, sfx: &mut SfxManager) {
                 //
                 // We collect snapshot data (name, position, wsk) to avoid
                 // holding borrows across log_combat / advance_initiative calls.
-                let enemy_snapshot = game
+                let enemy_snapshot = mission
                     .enemies
                     .iter()
                     .find(|e| e.id == id)
@@ -175,7 +176,7 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32, sfx: &mut SfxManager) {
                                     x: enemy_pos.x + dx,
                                     y: enemy_pos.y + dy,
                                 };
-                                if let Some(e) = game.enemies.iter_mut().find(|e| e.id == id) {
+                                if let Some(e) = mission.enemies.iter_mut().find(|e| e.id == id) {
                                     e.position = Some(new_pos);
                                 }
                                 log_combat(
@@ -231,7 +232,7 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32, sfx: &mut SfxManager) {
 
     // Victory: all enemies eliminated — transition to extraction then debrief.
     let all_enemies_dead =
-        !game.enemies.is_empty() && game.enemies.iter().all(|e| e.current_hp == 0);
+        !mission.enemies.is_empty() && mission.enemies.iter().all(|e| e.current_hp == 0);
 
     if all_enemies_dead {
         info!("All enemies eliminated — MISSION COMPLETE!");
