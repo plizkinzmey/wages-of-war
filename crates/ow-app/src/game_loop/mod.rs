@@ -27,14 +27,23 @@
 //! The loop targets 60 fps with delta-time tracking. Delta is capped at 33 ms
 //! (floor of 30 fps) to prevent physics/animation explosions on hitches.
 
+mod auto_screenshot;
+mod combat_log;
+mod dev_hotkeys;
 mod input;
 mod music;
 mod render;
+mod screenshot;
 mod update;
 
 use input::{handle_escape, handle_phase_input};
 use render::render_phase;
 use update::update_phase;
+
+pub(crate) use auto_screenshot::AutoScreenshot;
+pub(crate) use combat_log::{log_combat, CombatLogEntry, CombatLogKind};
+pub(crate) use dev_hotkeys::handle_dev_hotkeys;
+pub(crate) use screenshot::{save_screenshot, write_canvas_as_bmp};
 
 use std::path::Path;
 use std::time::Instant;
@@ -165,56 +174,6 @@ pub struct GameLoop {
     /// SoundFont), we stop retrying for the rest of the session. This
     /// prevents stderr spam from the MIDI loader on every frame.
     pub music_broken: bool,
-}
-
-/// Maximum number of combat log entries displayed on screen.
-const COMBAT_LOG_MAX: usize = 8;
-
-/// A single entry in the combat message log, with color-coding info.
-#[derive(Debug, Clone)]
-pub struct CombatLogEntry {
-    /// The message text to display.
-    pub text: String,
-    /// The category determines the display color.
-    pub kind: CombatLogKind,
-}
-
-/// Color categories for combat log entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CombatLogKind {
-    /// Player hit on enemy — green.
-    PlayerHit,
-    /// Enemy hit on player merc — red.
-    EnemyHit,
-    /// Any miss — gray.
-    Miss,
-    /// A unit was killed — yellow.
-    Kill,
-    /// Informational (movement, round changes) — white.
-    Info,
-}
-
-impl CombatLogKind {
-    /// Return the SDL2 color for this log category.
-    fn color(self) -> Color {
-        match self {
-            CombatLogKind::PlayerHit => Color::RGB(80, 220, 80),
-            CombatLogKind::EnemyHit => Color::RGB(220, 60, 60),
-            CombatLogKind::Miss => Color::RGB(160, 160, 160),
-            CombatLogKind::Kill => Color::RGB(255, 220, 50),
-            CombatLogKind::Info => Color::RGB(200, 200, 200),
-        }
-    }
-}
-
-/// Push a message to the combat log, trimming to [`COMBAT_LOG_MAX`] entries.
-fn log_combat(game: &mut GameLoop, msg: String, kind: CombatLogKind) {
-    debug!(combat_log = %msg, "Combat log entry");
-    game.combat_log.push(CombatLogEntry { text: msg, kind });
-    if game.combat_log.len() > COMBAT_LOG_MAX {
-        let excess = game.combat_log.len() - COMBAT_LOG_MAX;
-        game.combat_log.drain(..excess);
-    }
 }
 
 impl GameLoop {
@@ -608,28 +567,7 @@ pub fn run_game_loop_with_pump(
     // without anyone hand-pressing F12 every few seconds. Disabled by default;
     // pure dev tooling, gitignored output dir.
     // -----------------------------------------------------------------------
-    let auto_ss_interval_ms: Option<u128> = std::env::var("OW_AUTO_SCREENSHOT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &u128| n > 0);
-    let auto_ss_dir: Option<std::path::PathBuf> = if let Some(ms) = auto_ss_interval_ms {
-        let run_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dir = std::path::PathBuf::from(format!("dev-screenshots/run-{run_id}"));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            warn!(?dir, "auto-screenshot mkdir failed: {e} — feature disabled");
-            None
-        } else {
-            info!(interval_ms = ms, dir = %dir.display(), "Auto-screenshot enabled");
-            Some(dir)
-        }
-    } else {
-        None
-    };
-    let mut last_auto_ss = Instant::now();
-    let mut auto_ss_count = 0u32;
+    let mut auto_screenshot = AutoScreenshot::from_env();
 
     // -----------------------------------------------------------------------
     // Main loop: poll events -> update -> render -> present -> sleep
@@ -667,6 +605,7 @@ pub fn run_game_loop_with_pump(
                     debug!(width = w, height = h, "Window resized");
                 }
 
+                // ======= FILE-LEVEL HOTKEYS (F12 + F1-F5 + M) =======
                 // F12 saves a screenshot to disk.
                 Event::KeyDown {
                     keycode: Some(Keycode::F12),
@@ -675,89 +614,10 @@ pub fn run_game_loop_with_pump(
                     save_screenshot(&canvas);
                 }
 
-                // ======= DEV HOTKEYS =======
-                // F1: Skip to debrief (win current mission instantly)
-                Event::KeyDown {
-                    keycode: Some(Keycode::F1),
-                    ..
-                } => {
-                    info!("[DEV] F1: Force win → Debrief");
-                    game.game_state.set_phase(GamePhase::Debrief);
-                    game.phase_handler = PhaseHandler::Debrief {
-                        success: true,
-                        anim_elapsed_ms: 0,
-                    };
-                }
-
-                // F2: Skip to office (abort mission, go home)
-                Event::KeyDown {
-                    keycode: Some(Keycode::F2),
-                    ..
-                } => {
-                    info!("[DEV] F2: Force → Office");
-                    game.game_state.set_phase(GamePhase::Office(
-                        ow_core::game_state::OfficePhase::Overview,
-                    ));
-                    game.phase_handler = PhaseHandler::Office {
-                        sub_phase: ow_core::game_state::OfficePhase::Overview,
-                    };
-                }
-
-                // F3: Skip to deployment (start mission 1 with current team)
-                Event::KeyDown {
-                    keycode: Some(Keycode::F3),
-                    ..
-                } => {
-                    if game.game_state.team.is_empty() {
-                        info!("[DEV] F3: Can't deploy — no mercs hired");
-                    } else {
-                        info!("[DEV] F3: Force → Deployment (mission 1)");
-                        if game.game_state.current_mission.is_none() {
-                            game.game_state.current_mission =
-                                Some(ow_core::game_state::MissionContext {
-                                    name: "MSSN01".to_string(),
-                                    weather: ow_core::weather::Weather::Clear,
-                                    combat: None,
-                                    turn_number: 0,
-                                });
-                        }
-                        game.game_state.set_phase(GamePhase::Mission(
-                            ow_core::game_state::MissionPhase::Deployment,
-                        ));
-                        game.phase_handler = PhaseHandler::Deployment { selected_unit: 0 };
-                    }
-                }
-
-                // F4: Kill all enemies (instant win condition)
-                Event::KeyDown {
-                    keycode: Some(Keycode::F4),
-                    ..
-                } => {
-                    info!("[DEV] F4: Kill all enemies");
-                    game.enemies.clear();
-                }
-
-                // F5: Add $500k funds
-                Event::KeyDown {
-                    keycode: Some(Keycode::F5),
-                    ..
-                } => {
-                    game.game_state.funds += 500_000;
-                    info!("[DEV] F5: +$500k → funds={}", game.game_state.funds);
-                }
-
-                // M: Toggle music mute
-                Event::KeyDown {
-                    keycode: Some(Keycode::M),
-                    ..
-                } => {
-                    if sdl2::mixer::Music::get_volume() > 0 {
-                        sdl2::mixer::Music::set_volume(0);
-                        info!("[DEV] M: Music muted");
-                    } else {
-                        sdl2::mixer::Music::set_volume(64);
-                        info!("[DEV] M: Music unmuted");
-                    }
+                // F1-F5 + M (cheat/dev). `handle_dev_hotkeys` is a no-op on
+                // non-keydown events and on unknown keycodes.
+                Event::KeyDown { .. } => {
+                    handle_dev_hotkeys(&mut game, &event);
                 }
 
                 // Delegate all other input to the current phase handler
@@ -1320,19 +1180,9 @@ pub fn run_game_loop_with_pump(
 
         canvas.present();
 
-        // Dev auto-screenshot tick. Cheap when disabled (just two `if let`s).
-        if let (Some(ms), Some(dir)) = (auto_ss_interval_ms, auto_ss_dir.as_ref()) {
-            if now.duration_since(last_auto_ss).as_millis() >= ms {
-                let phase = phase_label(&game.phase_handler)
-                    .replace(' ', "_")
-                    .replace('—', "-")
-                    .replace('/', "_")
-                    .to_lowercase();
-                let path = dir.join(format!("ss_{:05}_{phase}.bmp", auto_ss_count));
-                save_screenshot_to_path(&canvas, &path);
-                auto_ss_count = auto_ss_count.saturating_add(1);
-                last_auto_ss = now;
-            }
+        // Dev auto-screenshot tick. Cheap when disabled (one field check).
+        if let Some(auto_ss) = auto_screenshot.as_mut() {
+            auto_ss.tick(&canvas, label);
         }
 
         // -- Frame pacing --
@@ -1470,82 +1320,5 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Screenshot — F12 saves the current frame to disk as BMP
+// Screenshot — F12 saves the current frame to disk as BMP. See `screenshot.rs`.
 // ---------------------------------------------------------------------------
-
-/// Save the current canvas contents to a specific path. Used by the dev
-/// auto-screenshot loop, which already controls the filename and doesn't
-/// need the collision search the F12 path takes.
-fn save_screenshot_to_path(canvas: &Canvas<Window>, path: &std::path::Path) {
-    let (w, h) = canvas.output_size().unwrap_or((1280, 720));
-    match canvas.read_pixels(None, sdl2::pixels::PixelFormatEnum::RGB24) {
-        Ok(pixels) => {
-            match sdl2::surface::Surface::from_data_pixelmasks(
-                &mut pixels.clone(),
-                w,
-                h,
-                w * 3,
-                &sdl2::pixels::PixelMasks {
-                    bpp: 24,
-                    rmask: 0xFF0000,
-                    gmask: 0x00FF00,
-                    bmask: 0x0000FF,
-                    amask: 0,
-                },
-            ) {
-                Ok(surface) => {
-                    if let Err(e) = surface.save_bmp(path) {
-                        warn!(path = %path.display(), "auto-screenshot save_bmp: {e}");
-                    }
-                }
-                Err(e) => warn!(path = %path.display(), "auto-screenshot surface: {e}"),
-            }
-        }
-        Err(e) => warn!(path = %path.display(), "auto-screenshot read_pixels: {e}"),
-    }
-}
-
-/// Save the current canvas contents to a BMP file.
-/// Files are named screenshot_001.bmp, screenshot_002.bmp, etc.
-fn save_screenshot(canvas: &Canvas<Window>) {
-    // Find the next available screenshot number.
-    let mut num = 1u32;
-    loop {
-        let path = format!("screenshot_{num:03}.bmp");
-        if !std::path::Path::new(&path).exists() {
-            // Read pixels from the canvas in its native format.
-            let (w, h) = canvas.output_size().unwrap_or((1280, 720));
-            match canvas.read_pixels(None, sdl2::pixels::PixelFormatEnum::RGB24) {
-                Ok(pixels) => {
-                    // RGB24 = 3 bytes per pixel, no alpha confusion.
-                    match sdl2::surface::Surface::from_data_pixelmasks(
-                        &mut pixels.clone(),
-                        w,
-                        h,
-                        w * 3,
-                        &sdl2::pixels::PixelMasks {
-                            bpp: 24,
-                            rmask: 0xFF0000,
-                            gmask: 0x00FF00,
-                            bmask: 0x0000FF,
-                            amask: 0,
-                        },
-                    ) {
-                        Ok(surface) => match surface.save_bmp(&path) {
-                            Ok(()) => info!("Screenshot saved: {path}"),
-                            Err(e) => warn!("Failed to save screenshot: {e}"),
-                        },
-                        Err(e) => warn!("Failed to create screenshot surface: {e}"),
-                    }
-                }
-                Err(e) => warn!("Failed to read pixels for screenshot: {e}"),
-            }
-            break;
-        }
-        num += 1;
-        if num > 999 {
-            warn!("Too many screenshots (>999)");
-            break;
-        }
-    }
-}
