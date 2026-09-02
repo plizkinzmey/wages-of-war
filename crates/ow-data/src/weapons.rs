@@ -12,7 +12,9 @@ use tracing::{debug, info, trace, warn};
 /// Weapon type category enumeration.
 ///
 /// Maps from integer values in the data file. Note gaps at 6 and 11.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum WeaponType {
     Rifle = 0,

@@ -18,6 +18,7 @@
 //! Inverse:
 //!   `world = screen / zoom + camera_offset`
 
+use sdl2::keyboard::Keycode;
 use tracing::trace;
 
 use crate::iso_math::{IsoConfig, ScreenPos};
@@ -68,6 +69,35 @@ impl Camera {
         self.x += dx;
         self.y += dy;
         trace!(x = self.x, y = self.y, "camera scrolled");
+    }
+
+    /// Apply a discrete scroll step for a WASD or arrow key. Returns
+    /// `true` if `key` is a camera-scroll key and the camera was
+    /// moved, `false` otherwise. Centralizes the WASD/arrow → scroll
+    /// mapping so input handlers don't each inline their own version.
+    ///
+    /// `speed` is in world units per press (matching the previous
+    /// inline blocks in `input.rs`).
+    pub fn scroll_for_key(&mut self, key: Keycode, speed: f32) -> bool {
+        match key {
+            Keycode::W | Keycode::Up => {
+                self.scroll(0.0, -speed);
+                true
+            }
+            Keycode::S | Keycode::Down => {
+                self.scroll(0.0, speed);
+                true
+            }
+            Keycode::A | Keycode::Left => {
+                self.scroll(-speed, 0.0);
+                true
+            }
+            Keycode::D | Keycode::Right => {
+                self.scroll(speed, 0.0);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Zoom in by one step (1.25x), clamped to the maximum zoom level.

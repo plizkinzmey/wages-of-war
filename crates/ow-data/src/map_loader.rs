@@ -352,6 +352,21 @@ impl GameMap {
     pub fn active_rows(&self) -> usize {
         GRID_HEIGHT
     }
+
+    /// Clamp a `(min_x, min_y, max_x, max_y)` tile-coordinate
+    /// rectangle to the map bounds. Negative coords are clamped to
+    /// 0; coordinates beyond `(width-1, height-1)` are clamped to
+    /// the last cell. Returns the same 4-tuple shape as
+    /// `Camera::visible_tile_bounds` so callers can substitute
+    /// directly.
+    pub fn clamp_tile_rect(&self, bounds: (i32, i32, i32, i32)) -> (usize, usize, usize, usize) {
+        let (min_x, min_y, max_x, max_y) = bounds;
+        let min_x = min_x.max(0) as usize;
+        let min_y = min_y.max(0) as usize;
+        let max_x = (max_x as usize).min(self.width().saturating_sub(1));
+        let max_y = (max_y as usize).min(self.height().saturating_sub(1));
+        (min_x, min_y, max_x, max_y)
+    }
 }
 
 /// Backwards-compatible view of a MapCell that exposes the old MapTile fields.
