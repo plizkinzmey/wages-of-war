@@ -37,8 +37,12 @@ rand = "0.8"
 # Pathfinding
 pathfinding = "4"
 
-# Rendering (SDL2)
-sdl2 = { version = "0.37", features = ["image", "mixer", "ttf"] }
+# Rendering (SDL2).
+# `use-pkgconfig` makes sdl2-sys discover the libs via PKG_CONFIG_PATH, which
+# .cargo/config.toml points at third_party/sdl2. We deliberately do NOT use
+# `bundled`: it compiles only SDL2 core, never mixer/image/ttf, and cannot
+# satisfy this project's rendering, audio, image and font needs on its own.
+sdl2 = { version = "0.38", features = ["image", "mixer", "ttf", "use-pkgconfig"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

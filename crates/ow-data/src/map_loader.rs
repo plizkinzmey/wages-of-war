@@ -201,7 +201,6 @@ pub enum MapError {
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct MapCell {
     // --- Word 1: tile indices + flags ---
-
     /// Primary terrain tile sprite index (9 bits, 0-511).
     pub tile_layer_0: u16,
     /// Secondary terrain overlay index (9 bits, 0-511).
@@ -218,7 +217,6 @@ pub struct MapCell {
     pub flag_walkable: bool,
 
     // --- Word 2: overlay tiles ---
-
     /// Overlay sprite A index (9 bits, 0-511).
     pub overlay_0: u16,
     /// Overlay sprite B index (9 bits, 0-511).
@@ -235,14 +233,12 @@ pub struct MapCell {
     pub overlay_transparent: bool,
 
     // --- Word 3: terrain/passability ---
-
     /// Base terrain type (8 bits, 0-255). 0=open, higher=different terrain.
     pub terrain_base: u8,
     /// 12 per-edge/corner passability modifiers (each 2 bits: 0=open, 1=partial, 2=full cover, 3=impassable).
     pub terrain_mods: [u8; 12],
 
     // --- Word 4: elevation ---
-
     /// Southwest corner height (6 bits, 0-63).
     pub elevation_sw: u8,
     /// Southeast corner height (6 bits, 0-63).
@@ -255,7 +251,6 @@ pub struct MapCell {
     pub elevation_flags: [u8; 4],
 
     // --- Word 5: objects/entities ---
-
     /// Object sprite index (8 bits, 0=none, 1-255=index into OBJ sprite file).
     pub object_id: u8,
     /// Object parameter 0 — sub-index or variant (6 bits, 0-63).
@@ -522,8 +517,10 @@ pub fn parse_map_bytes(data: &[u8], path: &Path) -> Result<GameMap, MapError> {
     debug!(version, "map version");
 
     // --- Scenario and waypoint data (raw, partially understood) ---
-    let scenario_data = data[SCENARIO_DATA_OFFSET..SCENARIO_DATA_OFFSET + SCENARIO_DATA_SIZE].to_vec();
-    let waypoint_data = data[WAYPOINT_DATA_OFFSET..WAYPOINT_DATA_OFFSET + WAYPOINT_DATA_SIZE].to_vec();
+    let scenario_data =
+        data[SCENARIO_DATA_OFFSET..SCENARIO_DATA_OFFSET + SCENARIO_DATA_SIZE].to_vec();
+    let waypoint_data =
+        data[WAYPOINT_DATA_OFFSET..WAYPOINT_DATA_OFFSET + WAYPOINT_DATA_SIZE].to_vec();
 
     let header = MapHeader {
         width: GRID_WIDTH as u32,
@@ -688,10 +685,26 @@ fn parse_entity_tables_as_strings(tables: &[Vec<u8>]) -> MapAssetRefs {
     };
 
     MapAssetRefs {
-        tileset_path: if tables.len() > 0 { read_string(&tables[0]) } else { String::new() },
-        tile_meta_path: if tables.len() > 1 { read_string(&tables[1]) } else { String::new() },
-        object_sprite_path: if tables.len() > 2 { read_string(&tables[2]) } else { String::new() },
-        object_meta_path: if tables.len() > 3 { read_string(&tables[3]) } else { String::new() },
+        tileset_path: if tables.len() > 0 {
+            read_string(&tables[0])
+        } else {
+            String::new()
+        },
+        tile_meta_path: if tables.len() > 1 {
+            read_string(&tables[1])
+        } else {
+            String::new()
+        },
+        object_sprite_path: if tables.len() > 2 {
+            read_string(&tables[2])
+        } else {
+            String::new()
+        },
+        object_meta_path: if tables.len() > 3 {
+            read_string(&tables[3])
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -779,10 +792,22 @@ mod tests {
         let data = make_test_map();
         let map = parse_map_bytes(&data, Path::new("test.MAP")).unwrap();
 
-        assert_eq!(map.asset_refs.tileset_path, r"C:\WOW\SPR\SCEN1\TILSCN01.TIL");
-        assert_eq!(map.asset_refs.tile_meta_path, r"C:\WOW\SPR\SCEN1\TILES1.DAT");
-        assert_eq!(map.asset_refs.object_sprite_path, r"C:\WOW\SPR\SCEN1\SCEN1.OBJ");
-        assert_eq!(map.asset_refs.object_meta_path, r"C:\WOW\SPR\SCEN1\OBJ01.DAT");
+        assert_eq!(
+            map.asset_refs.tileset_path,
+            r"C:\WOW\SPR\SCEN1\TILSCN01.TIL"
+        );
+        assert_eq!(
+            map.asset_refs.tile_meta_path,
+            r"C:\WOW\SPR\SCEN1\TILES1.DAT"
+        );
+        assert_eq!(
+            map.asset_refs.object_sprite_path,
+            r"C:\WOW\SPR\SCEN1\SCEN1.OBJ"
+        );
+        assert_eq!(
+            map.asset_refs.object_meta_path,
+            r"C:\WOW\SPR\SCEN1\OBJ01.DAT"
+        );
     }
 
     #[test]

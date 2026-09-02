@@ -1,6 +1,10 @@
 # Build
 /target
 
+# SDL2 stack built by scripts/bootstrap-sdl2.{sh,ps1} into the project.
+# Regenerated on demand — never commit compiled libs or headers.
+/third_party/sdl2/
+
 # Rust backup files
 **/*.rs.bk
 

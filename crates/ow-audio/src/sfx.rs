@@ -92,7 +92,10 @@ impl SfxManager {
         // but let's be explicit to ensure channels 2–7 exist).
         let total_channels = SFX_CHANNEL_END + 1;
         sdl2::mixer::allocate_channels(total_channels);
-        debug!(channels = total_channels, "SDL2_mixer channels allocated for SFX");
+        debug!(
+            channels = total_channels,
+            "SDL2_mixer channels allocated for SFX"
+        );
 
         if !snd_dir.exists() {
             warn!(dir = %snd_dir.display(), "SND directory not found — no combat SFX loaded");

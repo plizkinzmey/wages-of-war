@@ -3,9 +3,10 @@
 //! Provides a simple text rendering API backed by SDL2_ttf. The game uses this
 //! for all UI text: merc names, stat labels, contract terms, combat messages.
 //!
-//! We use a system font (Consolas on Windows) for now. The original game used
-//! bitmap fonts baked into its sprite sheets — we may switch to those later
-//! for pixel-perfect authenticity.
+//! We bundle the libre DejaVu Sans Mono font (see assets/fonts/) so text
+//! renders identically on every OS with no host font dependency. The original
+//! game used bitmap fonts baked into its sprite sheets — we may switch to
+//! those later for pixel-perfect authenticity.
 
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -39,20 +40,53 @@ impl<'ttf> TextRenderer<'ttf> {
     ///
     /// Tries these font paths in order:
     /// 1. The provided `font_path` if Some
-    /// 2. Windows Consolas (clean monospace, good for stats)
-    /// 3. Windows Arial (fallback)
+    /// 2. The bundled free font (assets/fonts/DejaVuSansMono.ttf), resolved
+    ///    against both the current working directory and the executable's own
+    ///    directory so it works regardless of where the binary is launched from.
+    /// 3. System monospace fonts (Windows Consolas, macOS Monaco, Linux DejaVu).
+    ///
+    /// Bundling a libre font (DejaVu, license in assets/fonts/) removes any
+    /// dependency on host-installed fonts — the game text renders identically
+    /// on every platform.
     pub fn new(ttf_context: &'ttf Sdl2TtfContext, font_path: Option<&str>) -> Result<Self, String> {
         // Try font paths in preference order.
-        let paths_to_try = if let Some(p) = font_path {
+        let paths_to_try: Vec<String> = if let Some(p) = font_path {
             vec![p.to_string()]
         } else {
-            vec![
+            let mut paths = Vec::new();
+
+            // Bundled font — probe several likely layouts so the executable
+            // can be run from anywhere (workspace root or a packaged bundle).
+            let bundled_relative = "assets/fonts/DejaVuSansMono.ttf";
+            paths.push(bundled_relative.to_string());
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    paths.push(
+                        exe_dir
+                            .join(bundled_relative)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    paths.push(
+                        exe_dir
+                            .join("../assets/fonts/DejaVuSansMono.ttf")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+
+            // System monospace fonts, in per-OS preference order.
+            paths.extend([
                 "C:\\Windows\\Fonts\\consola.ttf".to_string(),
                 "C:\\Windows\\Fonts\\arial.ttf".to_string(),
-                // Linux/macOS fallbacks for future cross-platform support
+                "/System/Library/Fonts/Monaco.ttf".to_string(),
+                "/System/Library/Fonts/Menlo.ttc".to_string(),
                 "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf".to_string(),
                 "/usr/share/fonts/TTF/DejaVuSansMono.ttf".to_string(),
-            ]
+            ]);
+
+            paths
         };
 
         let mut last_err = String::from("no fonts found");
